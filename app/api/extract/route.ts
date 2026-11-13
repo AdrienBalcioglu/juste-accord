@@ -1,6 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@/lib/supabase/server'
 import { NextRequest } from 'next/server'
+import { STEPS } from '@/lib/rc-logic'
+import { MAX_DOCUMENT_BYTES, isOverDocumentLimit } from '@/lib/limits'
 
 const EXTRACTION_PROMPTS: Record<string, string> = {
   bulletin_salaire: `Extrais les informations suivantes de ce bulletin de salaire et retourne UNIQUEMENT un JSON valide :
@@ -45,7 +47,31 @@ export async function POST(req: NextRequest) {
   const step_id = formData.get('step_id') as string
   const document_type = formData.get('document_type') as string
 
-  if (!file) return new Response('No file', { status: 400 })
+  if (!file || typeof file === 'string') return new Response('No file', { status: 400 })
+  if (file.type !== 'application/pdf') return new Response('PDF only', { status: 415 })
+  if (file.size > MAX_DOCUMENT_BYTES) return new Response('File too large', { status: 413 })
+  if (!/^[a-z_]{1,40}$/.test(document_type ?? '')) {
+    return new Response('Invalid document type', { status: 400 })
+  }
+
+  // The session must belong to the signed-in user before anything is stored or sent to Claude.
+  const { data: ownedSession } = await supabase
+    .from('rc_sessions')
+    .select('id, is_paid')
+    .eq('id', session_id)
+    .eq('user_id', user.id)
+    .single()
+  if (!ownedSession) return new Response('Session not found', { status: 404 })
+
+  const step = STEPS[step_id as keyof typeof STEPS]
+  if (!step) return new Response('Invalid step', { status: 400 })
+  if (step.isPremium && !ownedSession.is_paid) {
+    return new Response('Payment required', { status: 402 })
+  }
+
+  if (await isOverDocumentLimit(supabase)) {
+    return new Response('Daily limit reached', { status: 429 })
+  }
 
   const fileBuffer = await file.arrayBuffer()
   const storagePath = `${user.id}/${session_id}/${document_type}_${Date.now()}.pdf`

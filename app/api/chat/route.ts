@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@/lib/supabase/server'
 import { STEPS } from '@/lib/rc-logic'
 import { NextRequest } from 'next/server'
+import { MAX_MESSAGE_CHARS, isOverMessageLimit, sanitizeHistory } from '@/lib/limits'
 
 const STEP_ORDER = [
   'eligibility',
@@ -25,6 +26,10 @@ export async function POST(req: NextRequest) {
 
     const { session_id, step_id, message, history } = await req.json()
 
+    if (typeof message !== 'string' || message.length === 0 || message.length > MAX_MESSAGE_CHARS) {
+      return new Response('Invalid message', { status: 400 })
+    }
+
     const { data: session, error: sessionError } = await supabase
       .from('rc_sessions')
       .select('*, rc_steps(*)')
@@ -42,6 +47,10 @@ export async function POST(req: NextRequest) {
 
     if (step.isPremium && !session.is_paid) {
       return new Response('Payment required', { status: 402 })
+    }
+
+    if (await isOverMessageLimit(supabase)) {
+      return new Response('Daily limit reached', { status: 429 })
     }
 
     // __start__ is a hidden trigger to auto-begin — don't save to DB
@@ -70,7 +79,7 @@ Quand tu as collecté toutes les données nécessaires pour cette étape, termin
 
     const claudeMessages = isAutoStart
       ? [{ role: 'user' as const, content: '__start__' }]
-      : [...history, { role: 'user' as const, content: message }]
+      : [...sanitizeHistory(history), { role: 'user' as const, content: message }]
 
     const stream = await anthropic.messages.stream({
       model: 'claude-sonnet-4-6',
